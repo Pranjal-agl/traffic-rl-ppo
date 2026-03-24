@@ -20,11 +20,11 @@ After training for **200,000 timesteps** on CPU:
 
 | Metric | Fixed-Timer | PPO Agent | Improvement |
 |--------|-------------|-----------|-------------|
-| Avg Queue Length | ~X.XX | ~X.XX | **X% reduction** |
-| Episode Reward | ~-XXX | ~-XXX | ↑ |
-| Total Wait | ~XXXX | ~XXXX | ↓ |
+| Avg Queue Length | 3.61 | 0.60 | **83.4% reduction** |
+| Episode Reward | -1807.5 | -300.3 | ↑ |
+| Total Wait | 1615.7 | 300.2 | ↓ 81.4% |
 
-> Fill in values from running `python evaluate.py`
+> from running `python evaluate.py`
 
 ---
 
