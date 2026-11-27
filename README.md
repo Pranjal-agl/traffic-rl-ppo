@@ -1,4 +1,4 @@
-# 🚦 Traffic Signal Control with Reinforcement Learning
+#  Traffic Signal Control with Reinforcement Learning
 
 A custom **Gymnasium environment** simulating a 4-way intersection with realistic signal constraints (yellow clearance, minimum green, finite queues), and a **PPO agent** that learns to cut vehicle delay. It is compared against **tuned** engineering baselines, not a strawman.
 
