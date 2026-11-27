@@ -1,129 +1,178 @@
 """
-evaluate.py — Compare trained PPO agent vs fixed-timer baseline.
-              Prints a summary table and saves a metrics plot.
+evaluate.py — Compare the trained PPO agent against tuned baseline controllers.
+
+Every controller is run on exactly the same episodes (same seeds → same car
+arrivals), so differences are due to the controller, not luck. Results are
+reported with 95% confidence intervals and a paired PPO-vs-best-baseline test.
 
 Usage:
-    python evaluate.py
+    python evaluate.py                       # models/best_model.zip, 50 episodes/scenario
+    python evaluate.py --episodes 100 --model models/ppo_traffic.zip
+    python evaluate.py --retune              # re-run the baseline grid search first
+
+Outputs:
+    results/eval_results.json   raw per-episode metrics
+    results/results.md          summary table (paste-ready for the README)
+    metrics.png                 delay-per-vehicle comparison chart
+    training_curve.png          validation delay over training (if available)
 """
 
-import os, sys
-sys.path.insert(0, os.path.dirname(__file__))
+import argparse
+import json
+import os
+import sys
 
-import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import numpy as np
 from stable_baselines3 import PPO
-from env.traffic_env import TrafficEnv
 
-N_EPISODES   = 20
-FIXED_PERIOD = 10     # fixed-timer switches phase every N steps
+from baselines import SB3Policy, load_baselines, run_episode
+from env.traffic_env import SCENARIOS
+
+SCENARIO_ORDER = ["random", *SCENARIOS]
+SCENARIO_LABELS = {
+    "random": "Mixed\n(random demand)",
+    "balanced": "Balanced",
+    "asymmetric": "Asymmetric",
+    "rush_hour": "Rush hour",
+    "heavy": "Heavy",
+}
+METRICS = ["avg_delay", "avg_queue", "throughput", "rejected", "switches"]
+
+# categorical slots 1–3 of the validated reference palette (fixed order)
+COLORS = {"Fixed-time": "#257de0", "Max-pressure": "#f47230", "PPO": "#00b894"}
+TEXT, TEXT2, GRID = "#191919", "#666666", "#e6e6e6"
 
 
-def run_fixed_timer(n_episodes=N_EPISODES):
-    results = []
-    for _ in range(n_episodes):
-        env  = TrafficEnv()
-        obs, _ = env.reset()
-        done = False
-        step = 0
-        total_r = 0.0
-        action  = 0
-        while not done:
-            if step % FIXED_PERIOD == 0:
-                action = 1 - action      # alternate 0↔1
-            obs, r, terminated, truncated, _ = env.step(action)
-            total_r += r
-            done = terminated or truncated
-            step += 1
-        results.append({"reward": total_r, "avg_queue": env.avg_queue(),
-                         "total_wait": env.total_wait()})
+def ci95(x):
+    x = np.asarray(x, float)
+    return 1.96 * x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else 0.0
+
+
+def evaluate(policies, seeds):
+    results = {}
+    for sc in SCENARIO_ORDER:
+        results[sc] = {}
+        for p in policies:
+            eps = [run_episode(p, s, demand=sc) for s in seeds]
+            results[sc][p.name] = {m: [e[m] for e in eps] for m in METRICS}
     return results
 
 
-def run_ppo(model, n_episodes=N_EPISODES):
-    results = []
-    for _ in range(n_episodes):
-        env  = TrafficEnv()
-        obs, _ = env.reset()
-        done = False
-        total_r = 0.0
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, r, terminated, truncated, _ = env.step(int(action))
-            total_r += r
-            done = terminated or truncated
-        results.append({"reward": total_r, "avg_queue": env.avg_queue(),
-                         "total_wait": env.total_wait()})
-    return results
+def summarise(results):
+    lines = ["| Scenario | Controller | Delay / vehicle | Avg queue | Spilled-back cars | Phase switches |",
+             "|---|---|---|---|---|---|"]
+    print()
+    for sc, by_pol in results.items():
+        print(f"── {sc} " + "─" * (60 - len(sc)))
+        for name, m in by_pol.items():
+            d, q, r, s = (np.mean(m[k]) for k in ["avg_delay", "avg_queue", "rejected", "switches"])
+            print(f"  {name:13s} delay {d:6.2f} ± {ci95(m['avg_delay']):4.2f}   queue {q:6.2f}   "
+                  f"spilled {r:6.1f}   switches {s:5.1f}")
+            lines.append(f"| {SCENARIO_LABELS[sc].replace(chr(10), ' ')} | {name} | "
+                         f"{d:.2f} ± {ci95(m['avg_delay']):.2f} | {q:.2f} | {r:.1f} | {s:.0f} |")
+
+        if "PPO" in by_pol:
+            base = {k: v for k, v in by_pol.items() if k != "PPO"}
+            best = min(base, key=lambda k: np.mean(base[k]["avg_delay"]))
+            diff = np.array(by_pol["PPO"]["avg_delay"]) - np.array(base[best]["avg_delay"])
+            rel = -diff.mean() / np.mean(base[best]["avg_delay"]) * 100
+            sig = "significant" if abs(diff.mean()) > ci95(diff) else "not significant"
+            word = "lower" if rel > 0 else "higher"
+            print(f"  → PPO delay {abs(rel):.1f}% {word} than best baseline ({best}); "
+                  f"paired diff {diff.mean():+.2f} ± {ci95(diff):.2f} ({sig})")
+    return "\n".join(lines)
 
 
-def summarise(label, results):
-    rewards = [r["reward"]     for r in results]
-    queues  = [r["avg_queue"]  for r in results]
-    waits   = [r["total_wait"] for r in results]
-    print(f"\n{'─'*45}")
-    print(f"  {label}")
-    print(f"{'─'*45}")
-    print(f"  Mean episode reward : {np.mean(rewards):>8.1f}  ± {np.std(rewards):.1f}")
-    print(f"  Mean avg queue      : {np.mean(queues):>8.2f}  ± {np.std(queues):.2f}")
-    print(f"  Mean total wait     : {np.mean(waits):>8.1f}  ± {np.std(waits):.1f}")
-    return np.mean(rewards), np.mean(queues), np.mean(waits)
+def plot_delay(results, path="metrics.png"):
+    names = list(next(iter(results.values())).keys())
+    x = np.arange(len(results))
+    w = 0.8 / len(names)
+    fig, ax = plt.subplots(figsize=(11, 5.2), dpi=150)
+    for i, name in enumerate(names):
+        means = [np.mean(results[sc][name]["avg_delay"]) for sc in results]
+        errs = [ci95(results[sc][name]["avg_delay"]) for sc in results]
+        xs = x - 0.4 + w * (i + 0.5)
+        ax.bar(xs, means, w * 0.92, color=COLORS.get(name, "#888888"), label=name, zorder=2)
+        ax.errorbar(xs, means, yerr=errs, fmt="none", ecolor=TEXT2, elinewidth=1, capsize=2, zorder=3)
+        for xi, m, e in zip(xs, means, errs):
+            ax.text(xi, m + e + 0.6, f"{m:.1f}", ha="center", va="bottom", fontsize=8, color=TEXT)
+
+    ax.set_xticks(x, [SCENARIO_LABELS[sc] for sc in results], color=TEXT)
+    ax.set_ylabel("Average delay per vehicle (steps)  — lower is better", color=TEXT2)
+    ax.set_title("PPO vs tuned baselines, same traffic for every controller (95% CI)",
+                 loc="left", color=TEXT, fontsize=12, fontweight="bold")
+    ax.grid(axis="y", color=GRID, zorder=0)
+    for side in ["top", "right", "left"]:
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(GRID)
+    ax.tick_params(axis="y", colors=TEXT2, length=0)
+    ax.tick_params(axis="x", length=0)
+    ax.legend(frameon=False, ncol=len(names), loc="upper left", bbox_to_anchor=(0, 1.0))
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.08)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"✓ Plot saved → {path}")
 
 
-def plot_comparison(fixed_res, ppo_res):
-    fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-    fig.suptitle("PPO Agent vs Fixed-Timer Baseline", fontsize=14, fontweight="bold")
+def plot_training_curve(csv_path, baselines_summary, path="training_curve.png"):
+    if not os.path.exists(csv_path):
+        return
+    data = np.loadtxt(csv_path, delimiter=",", skiprows=1, ndmin=2)
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=150)
+    ax.plot(data[:, 0] / 1e6, data[:, 1], color=COLORS["PPO"], lw=2, label="PPO (validation)")
+    for name, val in baselines_summary.items():
+        ax.axhline(val, color=COLORS.get(name, "#888"), lw=1.5, ls="--", label=name)
+    ax.set_xlabel("Training steps (millions)", color=TEXT2)
+    ax.set_ylabel("Delay per vehicle (steps)", color=TEXT2)
+    ax.set_title("Learning curve on random demand", loc="left", color=TEXT, fontweight="bold")
+    ax.grid(color=GRID)
+    for side in ["top", "right"]:
+        ax.spines[side].set_visible(False)
+    lo = min(data[:, 1].min(), *baselines_summary.values())
+    ax.set_ylim(0, max(lo * 3, max(baselines_summary.values()) * 1.6))
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"✓ Plot saved → {path}")
 
-    metrics = [
-        ("reward",     "Episode Reward (higher = better)",   True),
-        ("avg_queue",  "Avg Queue Length (lower = better)",  False),
-        ("total_wait", "Total Wait (lower = better)",        False),
-    ]
 
-    colors = {"Fixed Timer": "#e05252", "PPO Agent": "#52a8e0"}
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="models/best_model.zip")
+    ap.add_argument("--episodes", type=int, default=50)
+    ap.add_argument("--retune", action="store_true")
+    args = ap.parse_args()
 
-    for ax, (key, title, higher_better) in zip(axes, metrics):
-        fixed_vals = [r[key] for r in fixed_res]
-        ppo_vals   = [r[key] for r in ppo_res]
+    policies = load_baselines(retune=args.retune)
+    if os.path.exists(args.model):
+        policies.append(SB3Policy(PPO.load(args.model), name="PPO"))
+    else:
+        print(f"No model at {args.model} — evaluating baselines only. Run  python train.py  first.")
 
-        x = np.arange(N_EPISODES)
-        ax.plot(x, fixed_vals, color=colors["Fixed Timer"], alpha=0.7,
-                linewidth=1.5, label="Fixed Timer")
-        ax.plot(x, ppo_vals,   color=colors["PPO Agent"],   alpha=0.7,
-                linewidth=1.5, label="PPO Agent")
-        ax.axhline(np.mean(fixed_vals), color=colors["Fixed Timer"],
-                   linestyle="--", linewidth=1, alpha=0.5)
-        ax.axhline(np.mean(ppo_vals),   color=colors["PPO Agent"],
-                   linestyle="--", linewidth=1, alpha=0.5)
-        ax.set_title(title, fontsize=11)
-        ax.set_xlabel("Episode")
-        ax.legend(fontsize=9)
-        ax.grid(alpha=0.3)
+    seeds = list(range(args.episodes))  # test seeds; tuning/validation use disjoint ranges
+    print(f"Evaluating {len(policies)} controllers × {len(SCENARIO_ORDER)} scenarios × {len(seeds)} episodes …")
+    results = evaluate(policies, seeds)
+    table = summarise(results)
 
-    plt.tight_layout()
-    plt.savefig("metrics.png", dpi=150, bbox_inches="tight")
-    print("\n✓ Plot saved → metrics.png")
-    plt.show()
+    os.makedirs("results", exist_ok=True)
+    with open("results/eval_results.json", "w") as f:
+        json.dump(results, f)
+    with open("results/results.md", "w") as f:
+        f.write(table + "\n")
+    print("\n✓ Results → results/eval_results.json, results/results.md")
+
+    plot_delay(results)
+    base = {n: float(np.mean(results["random"][n]["avg_delay"])) for n in results["random"] if n != "PPO"}
+    plot_training_curve(os.path.join(os.path.dirname(args.model) or ".", "val_curve.csv"), base)
 
 
 if __name__ == "__main__":
-    model_path = "models/best_model.zip"
-    if not os.path.exists(model_path):
-        print("No trained model found. Run  python train.py  first.")
-        sys.exit(1)
-
-    model = PPO.load("models/best_model")
-
-    print(f"\nEvaluating over {N_EPISODES} episodes each …")
-    fixed_res = run_fixed_timer()
-    ppo_res   = run_ppo(model)
-
-    r_f, q_f, w_f = summarise("Fixed-Timer Baseline", fixed_res)
-    r_p, q_p, w_p = summarise("PPO Agent",            ppo_res)
-
-    improvement = (q_f - q_p) / q_f * 100
-    print(f"\n{'='*45}")
-    print(f"  Queue reduction vs baseline: {improvement:.1f}%")
-    print(f"{'='*45}")
-
-    plot_comparison(fixed_res, ppo_res)
+    main()

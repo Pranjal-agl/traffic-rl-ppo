@@ -1,0 +1,12 @@
+{
+  "fixed_time": {
+    "green_ns": 16,
+    "green_ew": 16,
+    "tune_delay": 14.680462353684286
+  },
+  "max_pressure": {
+    "threshold": 6,
+    "max_green": 45,
+    "tune_delay": 9.894055587354865
+  }
+}

@@ -1,110 +1,271 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
+"""
+Single 4-way intersection with realistic signal switching.
 
-# ── Simulation constants ──────────────────────────────────────────────────────
-MAX_QUEUE   = 10        # max cars that can queue per lane
-NUM_LANES   = 4         # N, S, E, W
-SPAWN_PROB  = 0.3       # probability a new car spawns each step per lane
-GREEN_DUR   = 5         # how many steps a green phase lasts
-MAX_STEPS   = 500       # episode length
-DISCHARGE   = 2         # cars that leave per step on a green lane
+Lanes:   0 = North, 1 = South, 2 = East, 3 = West
+Phases:  0 = North/South green, 1 = East/West green
+
+What makes this non-trivial (and different from the v1 env):
+  * Changing phase costs a yellow / all-red clearance interval during which
+    nobody moves, and each green must last at least ``min_green`` steps.
+    Without this, the optimal policy is simply "flip the light every step".
+  * Demand differs per lane and drifts over the episode (e.g. a rush hour
+    that shifts from North/South to East/West), so a fixed timing plan
+    cannot be right all the time.
+  * Queues are finite; arrivals that find a full queue are rejected
+    (spill-back) and penalised, so the agent can't hide congestion by
+    letting a lane overflow.
+
+One step ~ one second-ish of simulated time; each green lane discharges
+``discharge`` vehicle(s) per step.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+NUM_LANES = 4
+LANE_NAMES = ("N", "S", "E", "W")
+PHASE_LANES = np.array(
+    [
+        [True, True, False, False],  # phase 0: N/S green
+        [False, False, True, True],  # phase 1: E/W green
+    ],
+    dtype=bool,
+)
+NUM_PHASES = len(PHASE_LANES)
+
+# Back-compat export used by older scripts.
+MAX_QUEUE = 40
+
+
+@dataclass
+class EnvConfig:
+    max_steps: int = 720          # episode length (truncation, not termination)
+    queue_cap: int = MAX_QUEUE    # vehicles per lane before spill-back
+    discharge: int = 1            # vehicles per green lane per step
+    yellow_steps: int = 3         # clearance time when switching (no discharge)
+    min_green: int = 5            # green must last at least this long
+    overflow_penalty: float = 5.0 # extra cost per rejected (spilled-back) vehicle
+    reward_scale: float = 0.1     # reward = -scale * (queued + penalty*rejected)
+    red_time_norm: float = 60.0   # obs normalisation for "time since green"
+    phase_time_norm: float = 60.0 # obs normalisation for "time in phase"
+    ema_alpha: float = 0.05       # smoothing for the arrival-rate detector
+    # Demand: "random" samples a fresh scenario each reset (used for training),
+    # or a dict / scenario name from SCENARIOS for fixed evaluation conditions.
+    demand: object = "random"
+
+
+# Demand is described by:
+#   rho    total critical flow ratio (≈ fraction of time the intersection
+#          must show green; >1 − lost-time fraction means oversaturated)
+#   split  share of rho going to the N/S approach (rest to E/W)
+#   amp    how far the split swings over the episode (sinusoid amplitude)
+#   period length of one swing, in steps
+#   phase  starting offset of the swing (radians)
+#   minor  ratio minor/major lane inside each approach pair
+SCENARIOS = {
+    "balanced":   dict(rho=0.60, split=0.50, amp=0.00, period=720, phase=0.0, minor=(1.0, 1.0)),
+    "asymmetric": dict(rho=0.70, split=0.72, amp=0.00, period=720, phase=0.0, minor=(0.6, 0.6)),
+    "rush_hour":  dict(rho=0.75, split=0.50, amp=0.25, period=720, phase=0.0, minor=(0.8, 0.8)),
+    "heavy":      dict(rho=0.88, split=0.55, amp=0.10, period=360, phase=1.0, minor=(0.9, 0.9)),
+}
+
+
+def sample_random_demand(rng: np.random.Generator, max_steps: int) -> dict:
+    return dict(
+        rho=float(rng.uniform(0.35, 0.90)),
+        split=float(rng.uniform(0.30, 0.70)),
+        amp=float(rng.uniform(0.0, 0.25)),
+        period=float(rng.choice([max_steps / 2, max_steps, 2 * max_steps])),
+        phase=float(rng.uniform(0, 2 * np.pi)),
+        minor=(float(rng.uniform(0.4, 1.0)), float(rng.uniform(0.4, 1.0))),
+    )
 
 
 class TrafficEnv(gym.Env):
     """
-    4-way single intersection.
+    Observation (16,), all roughly in [0, 1]:
+        queues / queue_cap                       (4)
+        smoothed arrival rate per lane           (4)   loop-detector estimate
+        time since lane last had green / norm    (4)   clipped to 1
+        current phase one-hot                    (2)
+        in-yellow flag                           (1)
+        time in current green / norm             (1)   clipped to 1
 
-    Observation (8,):
-        [queue_N, queue_S, queue_E, queue_W,
-         wait_N,  wait_S,  wait_E,  wait_W]
+    Action (Discrete 2): the phase the agent wants (0 = N/S, 1 = E/W).
+        Requesting the current phase holds it. Requesting the other phase
+        starts a yellow interval (if min_green has elapsed); requests during
+        yellow or before min_green are ignored.
 
-    Action (Discrete 4):
-        0 = give green to North/South pair
-        1 = give green to East/West pair
-        2 = give green to North only
-        3 = give green to East only
-        (agent picks every GREEN_DUR steps; action is held for GREEN_DUR ticks)
-
-    Reward:
-        −(total queue length) per step  →  agent minimises congestion
+    Reward: −reward_scale × (vehicles queued + overflow_penalty × rejected)
+        Summed over an episode this is total vehicle delay, so maximising
+        reward == minimising delay.
     """
 
-    metadata = {"render_modes": ["rgb_array"]}
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 12}
 
-    def __init__(self):
+    def __init__(self, config: Optional[EnvConfig] = None, render_mode: Optional[str] = None, **overrides):
         super().__init__()
+        cfg = config or EnvConfig()
+        if overrides:
+            cfg = EnvConfig(**{**asdict(cfg), **overrides})
+        self.cfg = cfg
+        self.render_mode = render_mode
 
-        # observation: queues (0‥MAX_QUEUE) + cumulative waits (0‥MAX_STEPS)
-        low  = np.zeros(8, dtype=np.float32)
-        high = np.array([MAX_QUEUE]*4 + [MAX_STEPS]*4, dtype=np.float32)
+        self.observation_space = spaces.Box(0.0, 1.0, shape=(16,), dtype=np.float32)
+        self.action_space = spaces.Discrete(NUM_PHASES)
+        self._renderer = None
 
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-        self.action_space      = spaces.Discrete(4)
+    # ── demand ────────────────────────────────────────────────────────────────
+    def _resolve_demand(self, options) -> dict:
+        demand = (options or {}).get("demand", self.cfg.demand)
+        if isinstance(demand, str):
+            if demand == "random":
+                return sample_random_demand(self.np_random, self.cfg.max_steps)
+            return dict(SCENARIOS[demand])
+        return dict(demand)
 
-        self.reset()
+    def arrival_rates(self, t: Optional[int] = None) -> np.ndarray:
+        d = self.demand
+        t = self.step_count if t is None else t
+        split = np.clip(d["split"] + d["amp"] * np.sin(2 * np.pi * t / d["period"] + d["phase"]), 0.05, 0.95)
+        ns, ew = d["rho"] * split, d["rho"] * (1 - split)
+        mn, me = d["minor"]
+        return np.clip(np.array([ns, ns * mn, ew, ew * me]), 0.0, 0.95)
 
     # ── helpers ──────────────────────────────────────────────────────────────
-    def _green_mask(self, action: int) -> np.ndarray:
-        """Return boolean mask of which lanes are green for this action."""
-        masks = {
-            0: [True,  True,  False, False],   # N+S green
-            1: [False, False, True,  True ],   # E+W green
-            2: [True,  False, False, False],   # N only
-            3: [False, False, True,  False],   # E only
-        }
-        return np.array(masks[action], dtype=bool)
+    @property
+    def in_yellow(self) -> bool:
+        return self.yellow_remaining > 0
+
+    def green_mask(self) -> np.ndarray:
+        if self.in_yellow:
+            return np.zeros(NUM_LANES, dtype=bool)
+        return PHASE_LANES[self.phase].copy()
 
     def _get_obs(self) -> np.ndarray:
-        return np.concatenate([self.queues, self.waits]).astype(np.float32)
+        c = self.cfg
+        obs = np.concatenate(
+            [
+                self.queues / c.queue_cap,
+                self.arrival_ema,
+                np.minimum(self.red_time / c.red_time_norm, 1.0),
+                np.eye(NUM_PHASES)[self.phase],
+                [float(self.in_yellow)],
+                [min(self.time_in_phase / c.phase_time_norm, 1.0)],
+            ]
+        )
+        return obs.astype(np.float32)
+
+    def _get_info(self) -> dict:
+        return {
+            "phase": self.phase,
+            "in_yellow": self.in_yellow,
+            "time_in_phase": self.time_in_phase,
+            "queues": self.queues.copy(),
+            "red_time": self.red_time.copy(),
+            "stats": dict(self.stats),
+        }
 
     # ── gym API ───────────────────────────────────────────────────────────────
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self.queues      = np.zeros(NUM_LANES, dtype=np.float32)
-        self.waits       = np.zeros(NUM_LANES, dtype=np.float32)
-        self.step_count  = 0
-        self.current_action = 0
-        self.phase_timer = 0          # counts down within a green phase
-        self.history     = []         # (step, queues copy) for analysis
-        return self._get_obs(), {}
+        self.demand = self._resolve_demand(options)
+        self.queues = np.zeros(NUM_LANES, dtype=np.float64)
+        self.red_time = np.zeros(NUM_LANES, dtype=np.float64)
+        self.arrival_ema = np.zeros(NUM_LANES, dtype=np.float64)
+        self.phase = int(self.np_random.integers(NUM_PHASES))
+        self.next_phase = self.phase
+        self.yellow_remaining = 0
+        self.time_in_phase = self.cfg.min_green  # allowed to switch immediately
+        self.step_count = 0
+        self.last_green = self.green_mask()
+        self.stats = dict(arrived=0, accepted=0, rejected=0, departed=0,
+                          delay=0.0, switches=0, max_queue=0.0)
+        return self._get_obs(), self._get_info()
 
-    def step(self, action: int):
+    def step(self, action):
+        c = self.cfg
+        action = int(action)
+        if not self.action_space.contains(action):
+            raise ValueError(f"invalid action {action}")
+
+        # 1. signal controller
+        if not self.in_yellow and action != self.phase and self.time_in_phase >= c.min_green:
+            self.stats["switches"] += 1
+            self.next_phase = action
+            if c.yellow_steps > 0:
+                self.yellow_remaining = c.yellow_steps
+            else:
+                self.phase, self.time_in_phase = action, 0
+
+        green = self.green_mask()
+        if self.in_yellow:
+            self.yellow_remaining -= 1
+            if self.yellow_remaining == 0:
+                self.phase, self.time_in_phase = self.next_phase, 0
+        else:
+            self.time_in_phase += 1
+
+        # 2. arrivals (with spill-back when the queue is full)
+        rates = self.arrival_rates()
+        arrivals = (self.np_random.random(NUM_LANES) < rates).astype(np.float64)
+        space = c.queue_cap - self.queues
+        accepted = np.minimum(arrivals, space)
+        rejected = arrivals - accepted
+        self.queues += accepted
+        self.arrival_ema += c.ema_alpha * (arrivals - self.arrival_ema)
+
+        # 3. departures on green lanes
+        served = np.minimum(self.queues, np.where(green, c.discharge, 0))
+        self.queues -= served
+
+        # 4. bookkeeping
+        self.red_time = np.where(green, 0.0, self.red_time + 1.0)
         self.step_count += 1
+        self.last_green = green
+        queued = float(self.queues.sum())
+        n_rej = float(rejected.sum())
+        s = self.stats
+        s["arrived"] += int(arrivals.sum())
+        s["accepted"] += int(accepted.sum())
+        s["rejected"] += int(n_rej)
+        s["departed"] += int(served.sum())
+        s["delay"] += queued
+        s["max_queue"] = max(s["max_queue"], float(self.queues.max()))
 
-        # ── 1. spawn cars ────────────────────────────────────────────────────
-        spawns = self.np_random.random(NUM_LANES) < SPAWN_PROB
-        self.queues = np.minimum(self.queues + spawns.astype(float), MAX_QUEUE)
+        reward = -c.reward_scale * (queued + c.overflow_penalty * n_rej)
+        terminated = False                            # no terminal state
+        truncated = self.step_count >= c.max_steps    # time limit → bootstrap
 
-        # ── 2. discharge cars on green lanes ─────────────────────────────────
-        green = self._green_mask(action)
-        discharge = np.where(green, DISCHARGE, 0).astype(float)
-        self.queues = np.maximum(self.queues - discharge, 0)
+        return self._get_obs(), reward, terminated, truncated, self._get_info()
 
-        # ── 3. accumulate wait for red lanes ─────────────────────────────────
-        self.waits += np.where(~green, self.queues, 0)
+    def render(self):
+        if self.render_mode != "rgb_array":
+            return None
+        if self._renderer is None:
+            from env.rendering import Renderer
+            self._renderer = Renderer()
+        return self._renderer.draw(self)
 
-        # ── 4. reward ────────────────────────────────────────────────────────
-        reward = -float(self.queues.sum())
+    # ── episode metrics ──────────────────────────────────────────────────────
+    def episode_metrics(self) -> dict:
+        s = self.stats
+        steps = max(self.step_count, 1)
+        return {
+            "avg_queue": s["delay"] / steps,                         # vehicles waiting, averaged over time
+            "avg_delay": s["delay"] / max(s["accepted"], 1),         # steps waited per vehicle
+            "throughput": s["departed"] / steps,                     # vehicles per step
+            "rejected": s["rejected"],                               # spill-back count
+            "switches": s["switches"],
+            "max_queue": s["max_queue"],
+        }
 
-        # ── 5. record history ────────────────────────────────────────────────
-        self.history.append({
-            "step":   self.step_count,
-            "queues": self.queues.copy(),
-            "action": action,
-            "green":  green.copy(),
-        })
-
-        terminated = self.step_count >= MAX_STEPS
-        truncated  = False
-
-        return self._get_obs(), reward, terminated, truncated, {}
-
-    # ── analysis helpers (used by evaluate.py) ───────────────────────────────
+    # kept for older callers
     def avg_queue(self) -> float:
-        if not self.history:
-            return 0.0
-        return float(np.mean([h["queues"].sum() for h in self.history]))
-
-    def total_wait(self) -> float:
-        return float(self.waits.sum())
+        return self.episode_metrics()["avg_queue"]

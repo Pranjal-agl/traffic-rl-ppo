@@ -1,4 +1,7 @@
 venv/
+.venv/
 logs/
+models/logs/
 __pycache__/
 *.pyc
+.pytest_cache/
